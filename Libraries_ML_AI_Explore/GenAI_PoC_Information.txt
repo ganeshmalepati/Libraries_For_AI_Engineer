@@ -1,0 +1,915 @@
+AGENTIC AI PROJECT INFO
+-----------------------
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# AutoHeal On-Box Runbook
+
+This README explains how to:
+
+- Run AutoHeal locally (non-SLM pipeline)
+- Verify accuracy and performance gates
+- Deploy on a Windows on-box device
+- Verify the same gates after deployment
+
+What this project does:
+- Loads daily, pre-aggregated sensor CSV data.
+- Runs per-sensor anomaly detection.
+- Correlates anomalies into incidents.
+- Composes deterministic remediation/verification plans and uses on-device SLM passes (Ollama) to produce grounded, actionable diagnosis outputs.
+
+## Scope
+
+This repo includes detectors, correlation, diagnosis, **SLM integration** (e.g. Ollama, demo UI), and other features. This runbook focuses on the **non-SLM** path and on-box deployment.
+
+The path covered here is:
+
+`collectors -> detectors -> accuracy gate -> correlate -> diagnose`
+
+SLM is optional for this runbook; see `scripts/README.md` and related scripts for SLM and other flows.
+
+## 1) Local setup
+
+From repo root:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install --upgrade pip
+.\.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+Optional quick sanity:
+
+```powershell
+.\.venv\Scripts\python scripts\run_detect_parallel.py --max_workers 1
+## Team Onboarding (Runtime First)
+
+Start here if you are new to the project and need to run diagnostics quickly.
+
+1) Confirm both runtime models are present:
+
+```bash
+ollama list
+ollama show local/llama3.2-1b-diagnose-lora-q8_0:latest
+ollama show llama3.2:latest
+```
+
+2) Run the known-good device smoke test with debug enabled:
+
+```bash
+python scripts/run_pipeline.py --data_dir data --out_dir out --config config/config.yaml --pipeline_type ollama --device edc502bfcef4755eff181f41764cb6727e6e110f69ec15166fb00e07e4858725 --debug_slm
+```
+
+`run_pipeline.py` now requires `--device` for demo-parity defaults. Use `--allow_all_devices` for legacy all-device batch runs.
+
+3) Validate outputs:
+- Diagnosis JSON: `out/diagnostics/diagnostic_<DEVICE>.json`
+- Debug payload: `out/diagnostics_debug/ollama_<DEVICE>.json`
+- Diagnose logs: `out/pipeline_logs/diagnose.log`
+
+4) Expected success signals for this smoke test:
+- `fallback_used = false`
+- `derived_plan_used = false`
+- `actionability_refiner_attempted = true`
+- `actionability_refiner_used = true`
+- `refined_steps_used = true`
+- `refined_verify_used = true`
+
+Detailed operator runbook: `docs/runtime_onboarding.md`
+
+## Model Access (Pull First, Rebuild Backup)
+
+Default runtime model in config:
+- `local/llama3.2-1b-diagnose-lora-q8_0:latest`
+- `slm_fallback_models` is retained for backward compatibility and ignored in deterministic-primary mode.
+
+### Path A: Use a team-shared prebuilt model (recommended)
+If your team publishes a shared tag, pull and run it directly:
+
+```bash
+ollama pull <team-shared-tag>
+ollama show <team-shared-tag>
+```
+
+## 2) Build labeled validation/holdout (accuracy input)
+
+If labeled datasets are missing or stale, rebuild them:
+
+```powershell
+.\.venv\Scripts\python scripts\build_labeled_holdout.py --sample_tags Ordered_Random --holdout_pct 20 --min_rows_per_split 100 --require_two_classes
+```
+
+Main outputs:
+
+- `data_labeled/validation`
+- `data_labeled/holdout`
+- `out/metrics/holdout_build_report.csv`
+
+## 3) Run baseline and peak profiles locally
+
+Run baseline:
+
+```powershell
+.\.venv\Scripts\python scripts\run_agent_profile.py --profile baseline
+```
+Run peak:
+
+```powershell
+.\.venv\Scripts\python scripts\run_agent_profile.py --profile peak
+```
+
+Profile knobs are controlled by `config/perf.yaml`.
+## Quick Validation Checklist
+```bash
+ollama list
+ollama show local/llama3.2-1b-diagnose-lora-q8_0:latest
+ollama show llama3.2:latest
+python scripts/run_pipeline.py --data_dir data --out_dir out --config config/config.yaml --pipeline_type ollama --topn 1 --device 011e560d27a319dfd2d8ee780e7552828ccbeb41dad30f00223dbe1fb8e3a8f5 --debug_slm
+python scripts/run_pipeline.py --data_dir data --out_dir out --config config/config.yaml --pipeline_type ollama --topn 1 --device 011e560d27a319dfd2d8ee780e7552828ccbeb41dad30f00223dbe1fb8e3a8f5 --debug_slm --mock_remediation_enabled
+# ONNX mode (defaults both primary and refiner model to models/onnx)
+python scripts/run_pipeline.py --data_dir data --out_dir out --config config/config.yaml --pipeline_type onnx --topn 1 --device 011e560d27a319dfd2d8ee780e7552828ccbeb41dad30f00223dbe1fb8e3a8f5
+```
+
+Expected result:
+- `out/diagnostics/*.json` includes keys `intent`, `steps`, `verify`, `risk`, `diagnosis_text`, `sources`, and `mock_remediation`.
+- `steps` and `verify` are populated arrays with inline citations like `(source.pdf:pN)`.
+- `mock_remediation.actions` shows ordered mock function calls with boolean `success` values (for battery: `batteryHealthStatusCheck`, then `batteryRepair`).
+- `out/diagnostics_debug/*.json` shows `fallback_used: false` and `derived_plan_used: false` for healthy runs.
+
+## KB-Grounded Diagnosis (RAG)
+- Runtime diagnosis now retrieves context from PDF knowledge base files in `data/KB`.
+- Retrieval is filtered for laptop-relevant fault domains and suppresses unrelated server/network guidance by default.
+- Runtime generation asks the SLM for a full plan (`intent`, `steps`, `verify`, `risk`, `diagnosis_text`, `sources`) grounded in retrieved KB context.
+- A second-pass actionability refiner (`llama3.2:latest` by default) can rewrite `steps` and `verify` using full extracted text from selected source PDFs.
+- `steps` and `verify` must include inline citations tied to retrieved KB pages; invalid/non-retrieved citations are rejected.
+- Deterministic playbook + KB extraction remains the fallback if grounded SLM steps/verify fail validation.
+- Runtime post-processing normalizes common refiner citation formats before grounding validation (for example, `allowed source:` wrappers and `source.pdf:pN` placeholders).
+- Prompt trimming may occur for token budget safety; canonical RAG retrieval hits are still preserved for grounding and finalization.
+- Refined `diagnosis_text` must mention the selected fault domain/subsystem; off-domain text is rejected.
+- If grounded plan validation fails, deterministic plan fields remain unchanged.
+
+Tune in `config/config.yaml` under `diagnosis`:
+- `slm_rag_enabled`
+- `slm_rag_kb_dir`
+- `slm_rag_top_k`
+- `slm_rag_min_score`
+- `slm_rag_chunk_chars`
+- `slm_rag_max_context_chars`
+- `slm_actionability_refiner_enabled`
+- `slm_actionability_refiner_model`
+- `slm_actionability_refiner_system_prompt`
+- `slm_actionability_refiner_options`
+- `slm_actionability_refiner_timeout_sec`
+- `slm_actionability_refiner_keep_alive`
+- `slm_actionability_refiner_url`
+- `slm_actionability_refiner_max_source_chars`
+- `slm_mock_remediation_enabled`
+- `slm_mock_remediation_outcomes`
+- `slm_mock_remediation_domain_actions`
+- `slm_playbook_path`
+
+Observability outputs:
+- `out/diagnostics.jsonl` includes `rag_hit_count`, `rag_sources`, `rag_top_hits`, `deterministic_primary`, `slm_text_refined`, `run_path_flags`, `derived_plan_reasons`, `fallback_used`, and `derived_plan_used`.
+- When actionability refiner is enabled, rows also include `actionability_refiner_attempted`, `actionability_refiner_used`, `actionability_refiner_model_used`, `refined_steps_used`, `refined_verify_used`, `source_docs_full_chars`, `source_docs_returned_chars`, and truncation fields.
+- When mock remediation is enabled, rows include `mock_remediation_enabled`, `mock_remediation_domain`, `mock_remediation_action_count`, `mock_remediation_overall_success`, and `mock_remediation_actions`.
+- `deterministic_primary: true` means plan composition stayed in deterministic primary mode.
+- `slm_text_refined: false` means deterministic diagnosis text seed was kept.
+- `out/diagnostics_debug/*.json` retains full `rag_hits`, selected source documents context stats, first-pass and actionability-pass prompts, and per-attempt traces.
+
+Current baseline tuning includes:
+
+- `profiles.baseline.sample_seconds: 0.35`
+- `profiles.baseline.detect_cusum_row_cap: 1200`
+
+## 4) Verify accuracy and performance gates
+
+### Option A: Single command (recommended)
+
+```powershell
+.\.venv\Scripts\python scripts\safe_optimize_cycle.py --reset_metrics
+```
+- For this pipeline, verify both `local/llama3.2-1b-diagnose-lora-q8_0:latest` and `llama3.2:latest` are available.
+- If actionability pass is attempted but not used, inspect `derived_plan_reasons` and citation validity in `out/diagnostics_debug/*.json`.
+- If source context is heavily truncated (`source_docs_context_truncated: true`), tune `slm_actionability_refiner_max_source_chars` and/or model `num_ctx`.
+
+This runs:
+
+1. `run_agent_profile.py --profile baseline`
+2. `run_agent_profile.py --profile peak`
+3. `check_release_readiness.py`
+
+### Option B: Manual gate check
+
+```powershell
+.\.venv\Scripts\python scripts\check_release_readiness.py
+```
+
+- Uses existing `data/` and `out/`.
+- Enter a device tag and run the pipeline to view diagnosis and confidence.
+- Results include diagnosis quality status, deterministic-primary indicators, and KB references (article, page, similarity score, snippet).
+- Status rows include actionability-pass telemetry (`attempted`, `used`, `model`, `refined_steps_used`, `refined_verify_used`) and source-document truncation indicators.
+
+Gate sources:
+
+- Accuracy metrics: `out/metrics/sensor_accuracy.csv`
+- Performance telemetry: `out/metrics/pipeline_telemetry.csv`
+- Run reliability ledger: `out/metrics/agent_run_ledger.csv`
+- Thresholds: `config/perf.yaml` (`accuracy` and `slo` sections)
+
+Expected pass criteria:
+## Outputs
+- `out/predictions/*.csv` - per-sensor prediction outputs.
+- `out/incidents.jsonl` - correlation incidents per device.
+- `out/incidents_summary.csv` - incident counts and prior scores.
+- `out/diagnostics/diagnostic_<DEVICE>.json` or `out/diagnostics/diagnostic_<DEVICE>_<IDX>.json` - diagnosis JSON output.
+- `out/diagnostics_metrics.csv` - per-call SLM timing/token metrics.
+
+- Accuracy: F1 >= 0.9 and Recall >= 0.9 on eligible sensors
+- Baseline SLO: CPU < 10%, Memory < 10%, Runtime < 60s, Latency < 1s
+- Peak SLO: CPU < 30%, Memory < 50%, Runtime < 180s, Latency < 5s
+- Success rate: >= 90%
+
+## 5) Key local outputs to inspect
+
+- `out/predictions/*.csv` - detector outputs
+- `out/metrics/pipeline_telemetry.csv` - stage runtimes, latency, CPU/memory
+- `out/metrics/sensor_accuracy.csv` - per-sensor validation/holdout accuracy
+- `out/metrics/agent_run_ledger.csv` - run status and rolling success rate
+- `out/incidents.jsonl` and `out/incidents_summary.csv` - correlation outputs
+- `out/plans/*` - diagnosis outputs (when inputs exist)
+
+## 6) Deploy on-box (Windows services)
+
+The on-box deployment uses NSSM services and named pipes.
+
+### Prerequisites
+
+- Windows machine with admin rights
+- Python installed
+- `nssm.exe` available
+
+### Install services
+
+```powershell
+.\services\install_services.ps1 -NssmPath "C:\Tools\nssm.exe"
+```
+
+What this does:
+
+- Copies repo to `C:\AutoHealOnBox` (excluding `.venv`)
+- Creates `C:\AutoHealOnBox\.venv` if missing
+- Installs dependencies from `requirements.txt` (unless `-SkipPipInstall`)
+- Installs one detector service per sensor: `AutoHeal_<sensor>`
+- Installs correlation service: `AutoHeal_Correlation`
+- Configures service logs in `C:\AutoHealOnBox\out\service_logs`
+
+Optional installer flags:
+
+```powershell
+.\services\install_services.ps1 -NssmPath "C:\Tools\nssm.exe" -CleanInstallDir
+.\services\install_services.ps1 -NssmPath "C:\Tools\nssm.exe" -SkipPipInstall
+```
+
+### Verify services are running
+
+```powershell
+Get-Service AutoHeal_* | Format-Table Name,Status
+```
+
+### Feed events to services (test input)
+
+From install directory:
+
+```powershell
+cd C:\AutoHealOnBox
+.\.venv\Scripts\python .\scripts\router_stream.py --inputs_dir .\data --transport pipe
+```
+
+## 7) Verify on-box behavior
+
+### Health checks
+
+- Service logs: `C:\AutoHealOnBox\out\service_logs`
+- Prediction sink: `C:\AutoHealOnBox\out\predictions\service`
+- Correlation outputs: `C:\AutoHealOnBox\out\incidents.jsonl`, `C:\AutoHealOnBox\out\incidents_summary.csv`
+
+### Performance and reliability checks on box
+
+Use the same profile/gate scripts from `C:\AutoHealOnBox`:
+
+```powershell
+.\.venv\Scripts\python scripts\run_agent_profile.py --profile baseline --skip_collectors
+.\.venv\Scripts\python scripts\run_agent_profile.py --profile peak --skip_collectors
+.\.venv\Scripts\python scripts\check_release_readiness.py
+```
+
+If you need a clean verification window:
+
+```powershell
+.\.venv\Scripts\python scripts\safe_optimize_cycle.py --reset_metrics
+```
+
+## 8) Troubleshooting
+
+- `accuracy_gate` fails:
+  - Rebuild labeled splits with `build_labeled_holdout.py`
+  - Check `out/metrics/sensor_accuracy.csv` for `eligible` and `status` columns
+- Missing telemetry rows:
+  - Confirm `out/metrics/pipeline_telemetry.csv` is writable
+  - Re-run profile with explicit `--run_id`
+- Service not starting:
+  - Check `Get-Service AutoHeal_*`
+  - Inspect `C:\AutoHealOnBox\out\service_logs\*.err.log`
+- No incidents generated:
+  - Ensure prediction files are being written in `out/predictions/service`
+  - Ensure correlation service is running
+
+## 9) Useful commands summary
+
+```powershell
+# Full local qualification cycle
+.\.venv\Scripts\python scripts\safe_optimize_cycle.py --reset_metrics
+
+# Run one profile
+.\.venv\Scripts\python scripts\run_agent_profile.py --profile baseline
+
+# Check release gates
+.\.venv\Scripts\python scripts\check_release_readiness.py
+
+# Install on-box services
+.\services\install_services.ps1 -NssmPath "C:\Tools\nssm.exe"
+```
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+# Scripts Usage
+
+All commands assume you run them from the repo root:
+
+```bash
+python scripts/<script>.py [options]
+```
+
+If you are using the virtual environment, run:
+
+```bash
+.\.venv\Scripts\python scripts/<script>.py [options]
+```
+
+## Script intent at a glance
+
+- Production pipeline flow:
+  - `run_detect.py` -> `run_correlate.py` -> `run_slm_diagnose.py`
+  - or all-in-one: `run_pipeline.py`
+- Model-development flow:
+  - Generate debug traces with `run_slm_diagnose.py --debug`
+  - Evaluate gate metrics with `eval_slm_quantized.py`
+  - Build SFT data with `build_slm_finetune_dataset.py`
+  - Train/export under `training/slm/`
+
+## Core pipelines
+
+- `run_detect.py`  
+  Sequentially runs all detectors and writes predictions to `out/predictions`.  
+  Example:
+  ```bash
+  python scripts/run_detect.py --threshold 0.5 --sample_seconds 0.5
+  ```
+
+- `run_detect_parallel.py`  
+  Runs detectors in parallel; supports service-like looping.  
+  Examples:
+  ```bash
+  python scripts/run_detect_parallel.py --max_workers 8
+  python scripts/run_detect_parallel.py --loop --sleep_seconds 300
+  ```
+
+- `run_correlate.py`  
+  Correlates anomalies from `out/predictions` into `out/incidents.jsonl`.  
+  Examples:
+  ```bash
+  python scripts/run_correlate.py
+  python scripts/run_correlate.py --include_state
+  ```
+
+- `run_pipeline.py`  
+  Runs end-to-end Detect -> Correlate -> SLM Diagnose with demo-parity defaults.
+  - Requires `--device` by default (use `--allow_all_devices` for legacy all-device runs).
+  - `--pipeline_type ollama` uses demo Ollama defaults.
+  - `--pipeline_type onnx` defaults both primary and refiner models to `models/onnx`.
+  Examples:
+  ```bash
+  python scripts/run_pipeline.py --data_dir data --out_dir out --config config/config.yaml --pipeline_type ollama --device <device_id> --debug_slm
+  python scripts/run_pipeline.py --data_dir data --out_dir out --config config/config.yaml --pipeline_type onnx --device <device_id>
+  ```
+
+- `generate_slm_prompts.py`  
+  Builds `out/incidents_with_priors.csv` and `out/slm_ranked_prompts.csv`.  
+  Example:
+  ```bash
+  python scripts/generate_slm_prompts.py
+  ```
+
+## Detector retraining
+
+- `append_new_cases_to_bad_csvs.py`  
+  Append `data/new_cases` rows into supervised `*_Bad.csv` files (deduped).  
+  Examples:
+  ```bash
+  python scripts/append_new_cases_to_bad_csvs.py
+  python scripts/append_new_cases_to_bad_csvs.py --dry_run
+  ```
+
+- `retrain_supervised_detectors.py`  
+  Append supervised bad rows, then retrain all 8 supervised detectors from scratch.  
+  Examples:
+  ```bash
+  python scripts/retrain_supervised_detectors.py
+  python scripts/retrain_supervised_detectors.py --append_dry_run
+  ```
+
+- `retrain_remaining_detectors.py`  
+  Append `data/CaseData` rows into remaining sensor `*_Ordered_Bad.csv` files,
+  rebuild `*_Ordered_Mixed.csv`, and refresh available artifacts.  
+  Examples:
+  ```bash
+  python scripts/retrain_remaining_detectors.py
+  python scripts/retrain_remaining_detectors.py --append_dry_run --rebuild_dry_run
+  ```
+
+## Validation and analysis
+
+- `validate_incidents_usecase.py`  
+  Validates incidents against `data/Tag-UseCase/tag_use_case_3000.csv`.  
+  Example:
+  ```bash
+  python scripts/validate_incidents_usecase.py --high_conf 0.7 --high_prior 1.0
+  ```
+## Benchmarking
+
+- `benchmark_services.py`  
+  Runs detector services with randomized load and optional correlation runs.  
+  Examples:
+  ```bash
+  python scripts/benchmark_services.py --rounds 5 --mode random --sample_sizes 1000,5000,all
+  python scripts/benchmark_services.py --run_correlation --write_predictions
+  ```
+
+- `evaluate_sensor_accuracy.py`  
+  Enforces per-sensor F1/Recall gates on validation and holdout datasets.  
+  Examples:
+  ```bash
+  python scripts/evaluate_sensor_accuracy.py --pred_dir out/predictions --validation_root data --holdout_root data/holdout
+  python scripts/evaluate_sensor_accuracy.py --freeze_baseline --baseline_out out/baselines/accuracy_baseline.json
+  ```
+
+- `build_labeled_holdout.py`  
+  Builds labeled validation/holdout datasets from `Tag-UseCase` device fault labels.  
+  Example:
+  ```bash
+  python scripts/build_labeled_holdout.py --sample_tags Ordered_Mixed --holdout_pct 20 --min_rows_per_split 100 --require_two_classes
+  ```
+
+- `run_agent_profile.py`  
+  Runs full non-SLM pipeline in baseline/peak profile and writes telemetry + run ledger.  
+  Examples:
+  ```bash
+  python scripts/run_agent_profile.py --profile baseline
+  python scripts/run_agent_profile.py --profile peak
+  ```
+
+- `check_release_readiness.py`  
+  Evaluates accuracy + SLO + success-rate release gates.  
+  Example:
+  ```bash
+  python scripts/check_release_readiness.py
+  ```
+
+- `safe_optimize_cycle.py`  
+  Runs guarded optimization cycle (baseline + peak + release gates).  
+  Example:
+  ```bash
+  python scripts/safe_optimize_cycle.py
+  ```
+
+
+- `analyze_missed_signals.py`  
+  Summarizes sensors and labels that missed ground-truth faults.  
+  Example:
+  ```bash
+  python scripts/analyze_missed_signals.py
+  ```
+
+- `check_prior_coverage.py`  
+  Measures causal prior coverage and missing sensor pairs.  
+  Example:
+  ```bash
+  python scripts/check_prior_coverage.py
+  ```
+
+- `map_multi_sensor_tags.py`  
+  Maps multi-sensor tags to `tag_use_case_3000.csv`.  
+  Example:
+  ```bash
+  python scripts/map_multi_sensor_tags.py
+  ```
+
+## Collectors and diagnostics
+
+- `run_collectors.py`  
+  Builds battery panel parquet from configured CSVs.  
+  Example:
+  ```bash
+  python scripts/run_collectors.py --config config/config.yaml --out out/panel_battery.parquet
+  ```
+
+- `run_diagnose.py`  
+  Runs diagnosis from anomaly/case CSVs and writes plans.  
+  Example:
+  ```bash
+  python scripts/run_diagnose.py --config config/config.yaml
+  ```
+
+- `eval_slm.py`  
+  Evaluates ONNX SLM strict JSON quality on `data/slm/test.jsonl` and writes reports.  
+  Example:
+  ```bash
+  python scripts/eval_slm.py --test_jsonl data/slm/test.jsonl --model_dir outputs/slm/onnx/<run_id>
+  ```
+- `run_slm_diagnose.py`  
+  Runs deterministic-primary diagnosis from `out/incidents.jsonl` with staged SLM refinement and per-call metrics CSV.  
+  Uses optional KB-grounded RAG retrieval from `data/KB` (configured in `config/config.yaml`) for laptop-domain remediation/verification grounding.  
+  After refinement, it can run a function pipeline for demo flows:
+  1) function-selection SLM (chooses callable Python functions)
+  2) function execution from `diagnosis/function_registry.py`
+  3) post-execution diagnosis SLM (separate output block; primary diagnosis remains unchanged)
+  Function outcomes are deterministic and configurable for demos.  
+  Can also append legacy mock remediation stage (no side effects).  
+  Emits observability metadata (`deterministic_primary`, `slm_text_refined`, `rag_sources`, `rag_top_hits`, `derived_plan_reasons`) in `out/diagnostics.jsonl` and detailed traces in `out/diagnostics_debug/*.json`.  
+  Fallback model chains are ignored in deterministic-primary mode.
+  Example:
+  ```bash
+  python scripts/run_slm_diagnose.py --incidents out/incidents.jsonl --slm_model local/llama3.2-1b-diagnose-lora-q8_0:latest --ab_models llama3.2:latest --metrics_out out/diagnostics_metrics.csv
+  ```
+  Debug/eval-oriented example:
+  ```bash
+  python scripts/run_slm_diagnose.py --incidents out/incidents.jsonl --slm_model local/llama3.2-1b-diagnose-lora-q8_0:latest --ab_models llama3.2:latest --debug --debug_dir out/diagnostics_debug_lora_ab --metrics_out out/diagnostics_metrics_lora_ab.csv
+  ```
+  Mock-remediation demo example:
+  ```bash
+  python scripts/run_slm_diagnose.py --incidents out/incidents.jsonl --mock_remediation_enabled --mock_remediation_outcomes_json "{\"batteryHealthStatusCheck\": true, \"batteryRepair\": false}"
+  ```
+  Function-execution demo example:
+  ```bash
+  python scripts/run_slm_diagnose.py --incidents out/incidents.jsonl --actionability_refiner_enabled --function_demo_outcomes_json "{\"checkBatteryStatus\": true, \"repairBattery\": false}" --debug
+  ```
+  RAG tuning keys (`diagnosis` config block):
+  - `slm_rag_enabled`
+  - `slm_rag_kb_dir`
+  - `slm_rag_top_k`
+  - `slm_rag_min_score`
+  - `slm_rag_chunk_chars`
+  - `slm_rag_max_context_chars`
+  Useful observability fields:
+  - `rag_hit_count`, `rag_sources`, `rag_top_hits`
+  - `run_path_flags` (deterministic-primary path + text-refinement notes)
+  - `deterministic_primary`, `slm_text_refined`, `derived_plan_reasons`
+  - `function_selection_model_used`, `function_selection_selected_count`, `function_selection_selected_functions`, `function_selection_reasons`
+  - `function_execution_action_count`, `function_execution_overall_success`, `function_execution_actions`
+  - `post_execution_diagnosis_model_used`, `post_execution_diagnosis_text`
+  - `mock_remediation_enabled`, `mock_remediation_action_count`, `mock_remediation_overall_success`, `mock_remediation_actions`
+  Full pipeline + edit guide: `docs/slm_function_execution_pipeline.md`
+
+- `build_slm_labels_from_incidents.py`  
+  Creates editable labels CSV from real `out/incidents.jsonl` (one row per incident).  
+  Example:
+  ```bash
+  python scripts/build_slm_labels_from_incidents.py --incidents out/incidents.jsonl --out_csv data/slm/labels.from_incidents.csv --default_bucket BAD
+  ```
+- `eval_slm_quantized.py`  
+  Evaluates SLM debug outputs (`out/diagnostics_debug`) and generates baseline-vs-candidate gate reports, including completeness and low-information gates.
+  Example:
+  ```bash
+  python scripts/eval_slm_quantized.py --debug_dirs out/diagnostics_debug --baseline_model llama3.2:latest --steps_min_count_rate_min 0.95 --verify_min_count_rate_min 0.95 --diagnosis_text_min_chars_rate_min 0.95 --deterministic_primary_rate_min 1.00 --derived_plan_used_rate_max 0.05 --low_information_rate_max 0.10 --out_dir out/slm_eval
+  ```
+
+Model-development command chain:
+```bash
+python scripts/run_slm_diagnose.py --incidents out/incidents.jsonl --slm_model local/llama3.2-1b-diagnose-lora-q8_0:latest --ab_models llama3.2:latest --debug --debug_dir out/diagnostics_debug_lora_ab --metrics_out out/diagnostics_metrics_lora_ab.csv
+python scripts/eval_slm_quantized.py --debug_dirs out/diagnostics_debug_lora_ab --baseline_model llama3.2:latest --steps_min_count_rate_min 0.95 --verify_min_count_rate_min 0.95 --diagnosis_text_min_chars_rate_min 0.95 --deterministic_primary_rate_min 1.00 --derived_plan_used_rate_max 0.05 --low_information_rate_max 0.10 --out_dir out/slm_eval
+```
+
+- `build_slm_finetune_dataset.py`  
+  Creates train/validation JSONL for SLM LoRA fine-tuning from incidents and labeled diagnosis outputs.
+  Supports runtime-parity `assistant_mode=refiner` prompts (`incident summary + targeted KB snippets -> diagnosis_text/risk`).
+  Example:
+  ```bash
+  python scripts/build_slm_finetune_dataset.py --incidents out/incidents.jsonl --labels_debug_dir out/diagnostics_debug_relabel --assistant_mode refiner --per_incident --topn 0 --derive_unlabeled --out_dir training/slm/data
+  ```
+
+Related training/export scripts:
+- `training/slm/train_lora.py` trains the LoRA adapter.
+- `training/slm/export_quantize_ollama.py` merges adapter, quantizes, and imports to Ollama.
+- Full runbook: `training/slm/README.md`.
+
+- `slm_pipeline.ps1`  
+  Orchestrates dataset -> train -> export -> quantize (optional) -> eval for Phi-3 Mini SLM.
+  Example:
+  ```powershell
+  .\scripts\slm_pipeline.ps1 -Cases out/incidents.jsonl -Labels data/slm/labels.csv
+  ```
+
+## Sensor-specific helpers
+
+- `router_stream.py`  
+  Routes CSV rows to sensors and can emit via named pipes.  
+  Example:
+  ```bash
+  python scripts/router_stream.py --inputs_dir data --sample_rows 1000 --transport pipe
+  ```
+
+- `run_detect_battery_mixed.py`  
+  Compares battery models on a specified dataset.  
+  Example:
+  ```bash
+  python scripts/run_detect_battery_mixed.py --csv data/Battery/Battery_Ordered_Mixed.csv
+  ```
+
+- `run_detect_text_sensors.py`  
+  Runs deterministic text sensor (BSOD) detection and cases.  
+  Example:
+  ```bash
+  python scripts/run_detect_text_sensors.py --sensor bsod --csv data/BSOD-Alerts/BSOD_Alerts_Ordered_Mixed.csv
+  ```
+
+- `run_correlate_sensors.py`  
+  Generates a per-device sensor summary from predictions.  
+  Example:
+  ```bash
+  python scripts/run_correlate_sensors.py --device <dv_service_tag> --inputs_dir out/predictions
+  ```
+
+- `run_correlate_interactive.py`  
+  Interactive version of `run_correlate_sensors.py`.  
+  Example:
+  ```bash
+  python scripts/run_correlate_interactive.py
+  ```
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+Data analysis is the process of turning raw data into insights you can act on. In service operations, that usually means answering questions like:
+
+Where are we seeing the most issues? (part, model, region)
+Is the problem getting better or worse over time?
+
+A simple lifecycle you can follow:
+
+Define the questions → e.g., “Which parts fail most often?” “Are battery issues trending up?”
+Understand the data → column meanings, data types, quality.
+Clean & prepare → parse dates, normalize labels, remove duplicates.
+Explore (EDA) → counts, trends, cross-tabs, charts.
+Diagnose → find drivers/associations (e.g., chi-square tests for categorical variables).
+Predict → if you have enough history, forecast case volume or failure risk.
+Prescribe → prioritize actions (e.g., Pareto 80/20, control charts) and measure outcomes.
+
+
+A helpful mental model: Descriptive → Diagnostic → Predictive → Prescriptive.
+
+
+"Insights refer to the meaningful conclusions drawn from analyzing data. They transform raw data into actionable information, helping to explain why certain events occurred and guiding decision-making processes. Insights provide a deeper understanding of data patterns, enabling organizations to adapt strategies, improve customer experiences"
+
+DV-Service-Tag, CaseID, Case-Data, F_NF_R, Use-Case
+
+
+
+--> At first we need to check the incident-summary file then we can check the dv-service or devices with incidents and with and without prior-score
+--> Then move to incidents-with-prior-score file so we can check the incidents that are with prior score is present in this or not. if there check what is 	the issue here like correlation like battery + fan or battery + memory or any other.
+--> Then we can combinedly check the all incidents and incidents-with-prior all of them in the slm-ranked-prompts that the incidents generated is perfect or      	not. 
+
+Eg. Take one device-id or tag check whether it have some incidents or not. If there then check in the incidents-with-prior-score if it have prior score or else check in the slm-ranked-prompts. so, that it will give the complete idea like how they are correlated with each other like battery + fan, battery + memory, battery + thermal etc. to verify take the device tag and confirm them in the each sensor separated whether they have anomalies with that issue or not. 
+
+
+
+BREIF INFO FOR ANOMALY DETECTION
+--------------------------------
+
+For Battery:- 			--> Check --> full-charge-capacity-in-MAH
+For Battery-Analysis:- 		--> Check --> cycle-count, charge-current-avg
+For Battery-Session-Analysis:-  --> Check --> hours-on, hours-on-battery
+For Fan:-			--> Check --> fan-rpm-avg
+For Memory:- 			--> Check --> pages-per-second-avg, usage-in-pct-avg
+For OS-Restart-Reboot 		--> Check --> os-last-start-time, ors-last-restart-time
+For Software-Inventory		--> Check --> version, install-Date
+For Thermal-Analysis 		--> Check --> temperature-in-Celsius-average
+For Unexpected-Shutdown 	--> Check --> 
+For Windows-Config		--> Check -->
+
+
+
+SLM Check:- 
+----------
+1 -> For every model we check we need to update the model name in config.yaml slm-model:- phi3:mini or 	llama3.2:latest 
+2 -> Check in the CPU and MEMORY utilization in the Task Manager for each model and compare them.
+
+3 -> Run the SLM UI with some device ids and compare the CPU, Avg-CPU, Memory and Peak-avg-time and all in the SLM 	UI provided
+4 -> Try for both llama3.2:latest and Phi3:mini SLM and Compare every component for better performance and 	practice the data prediction.
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+2/3/26
+------
+
+Checking the tag_use_case service tag present in all sensors or not.
+
+1-> Done NOT P in all sensors
+2-> Done Max sensor present is 5 battery_analysis, battery_session_analysis, fan_sensor, memory_sensor, os_restart_boot_sensor
+3-> Done NOT P in all sensors
+4-> Done NOT P in all sensors battery_analysis, battery_session_analysis, memory_sensor, os_restart_reboot
+5-> Done NOT P in all sensors
+6->
+
+
+
+
+SLM:- 
+1 8b77f14159d553d5c531c96121141cb55ac554688086bec8a0e63e54aaf514d3:- 
+sensors list:- battery_analysis, battery_session_analysis, memory_sensor, os_restart_reboot, fan_sensor, windows_config_sensor
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+23/02/26 Today's Observation
+----------------------------
+
+Expected pass criteria:
+
+Accuracy: F1 >= 0.9 and Recall >= 0.9 on eligible sensors
+Baseline SLO: CPU < 10%, Memory < 10%, Runtime < 60s, Latency < 1s
+Peak SLO: CPU < 30%, Memory < 50%, Runtime < 180s, Latency < 5s
+Success rate: >= 90%
+
+
+
+This runbook describes how to:
+
+Run AutoHeal locally on your machine (without SLM).
+Build accuracy datasets.
+Run performance profiles (baseline + peak).
+Validate accuracy + SLO gates.
+Deploy AutoHeal as Windows services on a real device.
+Verify behavior and troubleshoot.
+
+
+
+
+Outputs (What you’ll get)
+
+
+Validation split
+data_labeled/validation/
+
+Usually one file per sensor or a consolidated file with a sensor column.
+This is the split used for routine accuracy and tuning.
+
+
+
+Holdout split
+data_labeled/holdout/
+
+Kept “clean” for final evaluation; don’t use this to tune thresholds.
+
+
+
+
+
+How to validate it worked
+
+
+Check the report
+Open out/metrics/holdout_build_report.csv. Confirm sensors show eligible=TRUE.
+
+
+Check split folders
+Ensure files exist under:
+
+data_labeled/validation/
+data_labeled/holdout/
+
+
+
+
+
+
+
+
+⭐ In short — What this command is trying to do
+👉 Read CSV sensor data
+👉 Convert it into events
+👉 Send the events to your AutoHeal Windows service via named pipes
+👉 Trigger processing / healing logic on the service side
+This is part of the end‑to‑end AutoHeal workflow where local scripts simulate sensor input while the backend service responds.
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+Case ID:- 0da06f15a456aa3faf14658fbde62bb51c598e463e9e187f3c24ecabafe14327 
+--------------------------------------------------------------------------
+
+In the SLM pipeline, when we provide a case ID, the system retrieves the corresponding data points from the ordered mixed data. However, when I tested the pipeline using the case ID:
+0da06f15a456aa3faf14658fbde62bb51c598e463e9e187f3c24ecabafe14327
+the pipeline labeled it as a Driver Issue during manual validation.
+When I checked the application_sensor.csv file inside the ordered mixed data, this specific case ID was not present in the dataset. Despite that, the pipeline still generated anomaly outputs for this case ID using the application sensor data.
+So the issue is:
+The SLM pipeline is producing anomalies for a case ID that does not exist in the ordered mixed data file, even though the pipeline logic is supposed to source the data directly from that file.
+
+
+For example, if the SLM pipeline is pulling data points from the CaseData folder, we see a mismatch between the input data and the anomalies generated.
+When checking the anomaly count for os-restart-and-reboot, the corresponding CSV file in the CaseData folder contains only 58 data points.
+However, the SLM pipeline generated 464 anomalies for the same case.
+This raises the question:
+Is the pipeline combining data from both Ordered Mixed Data and the CaseData folder when generating anomalies?
+Because based on the numbers, it looks like the SLM pipeline might be using a mixture of both sources instead of relying solely on the CaseData folder.
+
+
+
+“I ran run-detect.py, run-correlate.py, and then generate-slm-prompt.py in CMD. These generated outputs such as anomaly predictions, incident summaries, and SLM prompt rankings. When I ran a single case ID through the SLM UI pipeline, the response it produced— including anomalies, issue confidence, and incident counts—matched perfectly with the results from the CMD run. This confirms that both the CMD-based workflow and the SLM UI pipeline are producing consistent outputs.”
+
+
+
+
+C) Event-based time series evaluation (simple detection delay)
+
+
+def events_from_labels(y_true):
+    # returns list of (start_idx, end_idx) for each contiguous anomaly block
+    events = []
+    in_event = False
+    for i, v in enumerate(y_true):
+        if v == 1 and not in_event:
+            start = i; in_event = True
+        if v == 0 and in_event:
+            events.append((start, i-1)); in_event = False
+    if in_event:
+        events.append((start, len(y_true)-1))
+    return events
+
+def detection_delay(y_true, y_pred):
+    events = events_from_labels(y_true)
+    delays = []
+    for (s,e) in events:
+        preds = np.where(np.array(y_pred[s:e+1]) == 1)[0]
+        if len(preds) > 0:
+            delay = int(preds[0])  # steps after s
+            delays.append(delay)
+    return {
+        "Detected_Events": len(delays),
+        "Total_Events": len(events),
+        "Event_Recall": len(delays) / len(events) if events else 0.0,
+        "Median_Delay": float(np.median(delays)) if delays else None,
+        "P90_Delay": float(np.percentile(delays, 90)) if delays else None
+    }
+
+
+
+
+
+5) Evaluating LLM/SLM anomaly detectors (text or tool-augmented)
+If the model explains anomalies in natural language (e.g., “Yes, anomaly: reason…”):
+
+
+Enforce structured output
+Prompt the model to output JSON with keys like is_anomaly, reason, confidence. That makes automated scoring possible.
+
+
+Automated evaluation
+
+Classification metrics on is_anomaly (as above).
+Extraction quality if it outputs entities (timestamp, service, metric, threshold): use exact match or fuzzy similarity (e.g., Levenshtein ratio).
+
+
+
+Faithfulness/groundedness checks
+
+Consistency under paraphrase: ask the same case multiple ways; measure decision stability.
+Attribution: require the LLM to cite which fields/statistics led to its decision; verify that those actually exist in the input.
+Schema validation for the JSON (reject unparseable or missing fields).
+
+
+
+Human-eval spot checks
+
+Random samples of TPs/FPs/FNs with a rubric (correctness, clarity, evidence, actionability).
+Track inter-rater agreement (Cohen’s κ).
+
